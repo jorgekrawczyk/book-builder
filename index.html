@@ -893,111 +893,194 @@ const ProjectEditor = ({project, onBack, onUpdate}) => {
 };
 
 // ─── STORAGE HELPERS ──────────────────────────────────────────────────────
-const STORAGE_KEYS = { projects: 'bb_projects', currentId: 'bb_current_id' };
+const STORAGE_KEYS = { projects:'bb_projects', currentId:'bb_current_id', ghToken:'bb_gh_token', gistId:'bb_gist_id' };
 const load = (key, fallback) => { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; } };
 const save = (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} };
 
-// ─── SYNC MODAL ───────────────────────────────────────────────────────────
-const SyncModal = ({projects, onImport, onClose}) => {
-  const [tab, setTab] = useState('export');
-  const [importText, setImportText] = useState('');
-  const [importError, setImportError] = useState('');
-  const [copied, setCopied] = useState(false);
-  const exportData = JSON.stringify({v:1, exportedAt: Date.now(), projects}, null, 2);
+// ─── GITHUB GIST API ──────────────────────────────────────────────────────
+const GIST_FILENAME = 'book-builder-data.json';
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(exportData).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);});
-  };
-  const handleDownload = () => {
-    const blob = new Blob([exportData], {type:'application/json'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href=url; a.download='book-builder-backup.json'; a.click(); URL.revokeObjectURL(url);
-  };
-  const handleImport = () => {
+const gistPush = async (token, gistId, projects) => {
+  const body = { files: { [GIST_FILENAME]: { content: JSON.stringify({v:1, savedAt: Date.now(), projects}) } } };
+  if (gistId) {
+    const r = await fetch(`https://api.github.com/gists/${gistId}`, {
+      method:'PATCH', headers:{'Authorization':`token ${token}`,'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error('Falha ao salvar no Gist');
+    return gistId;
+  } else {
+    const r = await fetch('https://api.github.com/gists', {
+      method:'POST', headers:{'Authorization':`token ${token}`,'Content-Type':'application/json'},
+      body: JSON.stringify({...body, description:'Book Builder - dados sincronizados', public: false})
+    });
+    if (!r.ok) throw new Error('Falha ao criar Gist');
+    const data = await r.json();
+    return data.id;
+  }
+};
+
+const gistPull = async (token, gistId) => {
+  const r = await fetch(`https://api.github.com/gists/${gistId}`, {
+    headers:{'Authorization':`token ${token}`}
+  });
+  if (!r.ok) throw new Error('Gist não encontrado');
+  const data = await r.json();
+  const content = data.files[GIST_FILENAME]?.content;
+  if (!content) throw new Error('Arquivo não encontrado no Gist');
+  const parsed = JSON.parse(content);
+  if (!parsed.projects) throw new Error('Formato inválido');
+  return parsed.projects;
+};
+
+// ─── CLOUD SETUP MODAL ────────────────────────────────────────────────────
+const CloudModal = ({onClose, onSaved, initialToken, initialGistId}) => {
+  const [token, setToken] = useState(initialToken || '');
+  const [gistId, setGistId] = useState(initialGistId || '');
+  const [status, setStatus] = useState(''); // 'loading' | 'ok' | 'error'
+  const [msg, setMsg] = useState('');
+
+  const handleSave = async () => {
+    if (!token.trim()) return;
+    setStatus('loading'); setMsg('Validando token…');
     try {
-      const data = JSON.parse(importText.trim());
-      if(!data.projects || !Array.isArray(data.projects)) throw new Error('Formato inválido');
-      onImport(data.projects);
-      onClose();
-    } catch(e) { setImportError('Arquivo inválido. Use um backup exportado pelo Book Builder.'); }
-  };
-  const handleFileImport = (e) => {
-    const file = e.target.files[0]; if(!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => setImportText(ev.target.result);
-    reader.readAsText(file);
+      const r = await fetch('https://api.github.com/user', { headers:{'Authorization':`token ${token.trim()}`} });
+      if (!r.ok) throw new Error('Token inválido ou sem permissão de Gist.');
+      const u = await r.json();
+      setMsg(`Conectado como @${u.login} ✓`);
+      setStatus('ok');
+      onSaved(token.trim(), gistId.trim());
+    } catch(e) {
+      setStatus('error'); setMsg(e.message);
+    }
   };
 
   return (
-    <Modal title="Sincronizar Dados" subtitle="Transfira seus projetos entre dispositivos." onClose={onClose}>
-      <div className="tabs" style={{marginBottom:16}}>
-        <button className={`tab ${tab==='export'?'active':''}`} onClick={()=>setTab('export')}><Icon name="download" size={13}/>Exportar</button>
-        <button className={`tab ${tab==='import'?'active':''}`} onClick={()=>setTab('import')}><Icon name="upload" size={13}/>Importar</button>
+    <Modal title="☁️ Sincronização na Nuvem" onClose={onClose}
+      subtitle="Configure uma vez e seus dados ficam salvos no GitHub automaticamente.">
+
+      <div className="alert alert-info" style={{marginBottom:16}}>
+        <Icon name="info" size={14}/>
+        <div>
+          <strong>Como funciona:</strong> seus projetos ficam salvos num arquivo privado (Gist) na sua conta do GitHub. Qualquer dispositivo com o mesmo token acessa os mesmos dados.
+        </div>
       </div>
 
-      {tab === 'export' && (<>
-        <div className="alert alert-info" style={{marginBottom:14}}><Icon name="info" size={14}/>
-          <span>Baixe o backup e envie para o iPhone (via iCloud, WhatsApp, e-mail…). Depois abra o app no iPhone e importe.</span>
+      <div className="form-group">
+        <label className="form-label">1. Crie um Personal Access Token no GitHub</label>
+        <div style={{background:'var(--bg)',border:'1px solid var(--border)',borderRadius:8,padding:12,fontSize:13,color:'var(--text2)',lineHeight:1.7}}>
+          Acesse: <a href="https://github.com/settings/tokens/new" target="_blank" style={{color:'var(--accent)',fontWeight:500}}>github.com/settings/tokens/new</a><br/>
+          → <strong>Token name:</strong> Book Builder<br/>
+          → Marque apenas: <span className="badge badge-green" style={{fontSize:11}}>✓ gist</span><br/>
+          → Clique <strong>Generate token</strong> e copie o token
         </div>
-        <div style={{display:'flex',gap:8,marginBottom:12}}>
-          <button className="btn btn-primary" style={{flex:1,justifyContent:'center'}} onClick={handleDownload}>
-            <Icon name="download" size={14}/>Baixar backup (.json)
-          </button>
-          <button className="btn btn-secondary" onClick={handleCopy}>
-            {copied ? <><Icon name="check" size={14}/>Copiado!</> : <><Icon name="edit" size={14}/>Copiar</>}
-          </button>
-        </div>
-        <div style={{background:'var(--bg)',border:'1px solid var(--border)',borderRadius:8,padding:12,maxHeight:120,overflow:'auto'}}>
-          <pre style={{fontSize:11,color:'var(--text2)',fontFamily:'DM Mono,monospace',whiteSpace:'pre-wrap',wordBreak:'break-all'}}>{exportData.slice(0,400)}…</pre>
-        </div>
-        <p style={{fontSize:12,color:'var(--text2)',marginTop:10}}>{projects.length} projeto(s) · exportado agora</p>
-      </>)}
+      </div>
 
-      {tab === 'import' && (<>
-        <div className="alert alert-warning" style={{marginBottom:14}}><Icon name="alertCircle" size={14}/>
-          <span>Importar vai <strong>substituir</strong> todos os projetos deste dispositivo.</span>
+      <div className="form-group">
+        <label className="form-label">2. Cole o token aqui</label>
+        <input className="form-input" type="password" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+          value={token} onChange={e=>{setToken(e.target.value);setStatus('');setMsg('');}}/>
+      </div>
+
+      <div className="form-group" style={{marginBottom:4}}>
+        <label className="form-label">ID do Gist existente <span style={{color:'var(--text2)',fontWeight:400}}>(deixe vazio para criar novo)</span></label>
+        <input className="form-input" placeholder="a1b2c3d4e5f6… (opcional)" value={gistId} onChange={e=>setGistId(e.target.value)}/>
+      </div>
+
+      {msg && (
+        <div className={`alert alert-${status==='ok'?'success':status==='error'?'error':'info'}`} style={{marginTop:12}}>
+          {status==='loading' && <span className="spinner"/>}
+          {status==='ok' && <Icon name="check" size={14}/>}
+          {status==='error' && <Icon name="alertCircle" size={14}/>}
+          {msg}
         </div>
-        <div className="form-group">
-          <label className="form-label">Selecionar arquivo de backup</label>
-          <input type="file" accept=".json" className="form-input" style={{padding:'7px 10px',fontSize:13}} onChange={handleFileImport}/>
-        </div>
-        <div className="form-group">
-          <label className="form-label">Ou cole o conteúdo aqui</label>
-          <textarea className="form-input form-textarea" placeholder='{"v":1,"projects":[…]}' value={importText} onChange={e=>{setImportText(e.target.value);setImportError('');}} style={{minHeight:90,fontSize:12,fontFamily:'DM Mono,monospace'}}/>
-        </div>
-        {importError && <div className="alert alert-error"><Icon name="alertCircle" size={14}/>{importError}</div>}
-        <div className="modal-footer" style={{paddingTop:0,borderTop:'none',marginTop:4}}>
-          <button className="btn btn-secondary" onClick={onClose}>Cancelar</button>
-          <button className="btn btn-primary" onClick={handleImport} disabled={!importText.trim()}>
-            <Icon name="check" size={14}/>Importar Projetos
-          </button>
-        </div>
-      </>)}
+      )}
+
+      <div className="modal-footer">
+        <button className="btn btn-secondary" onClick={onClose}>Cancelar</button>
+        <button className="btn btn-primary" onClick={handleSave} disabled={!token.trim() || status==='loading'}>
+          {status==='loading' ? <><span className="spinner" style={{borderTopColor:'#fff',borderColor:'rgba(255,255,255,.3)'}}/> Validando…</> : <><Icon name="check" size={14}/>Salvar e conectar</>}
+        </button>
+      </div>
     </Modal>
   );
 };
 
 // ─── MAIN APP ─────────────────────────────────────────────────────────────
 const App = () => {
-  const [projects, setProjects] = useState(() => load(STORAGE_KEYS.projects, []));
+  const [projects, setProjects]           = useState(() => load(STORAGE_KEYS.projects, []));
   const [currentProjectId, setCurrentProjectId] = useState(() => load(STORAGE_KEYS.currentId, null));
-  const [showSync, setShowSync] = useState(false);
+  const [ghToken, setGhToken]             = useState(() => load(STORAGE_KEYS.ghToken, ''));
+  const [gistId, setGistId]               = useState(() => load(STORAGE_KEYS.gistId, ''));
+  const [showCloud, setShowCloud]         = useState(false);
+  const [cloudStatus, setCloudStatus]     = useState('idle'); // 'idle'|'syncing'|'ok'|'error'
+  const [cloudMsg, setCloudMsg]           = useState('');
+  const syncTimeout = useRef(null);
 
-  // Persist whenever state changes
+  // Persist local
   useEffect(() => { save(STORAGE_KEYS.projects, projects); }, [projects]);
   useEffect(() => { save(STORAGE_KEYS.currentId, currentProjectId); }, [currentProjectId]);
 
-  const currentProject = projects.find(p => p.id === currentProjectId);
+  // Auto-push to Gist 2s after any project change
+  useEffect(() => {
+    if (!ghToken) return;
+    clearTimeout(syncTimeout.current);
+    syncTimeout.current = setTimeout(async () => {
+      setCloudStatus('syncing');
+      try {
+        const newGistId = await gistPush(ghToken, gistId, projects);
+        if (newGistId !== gistId) {
+          setGistId(newGistId);
+          save(STORAGE_KEYS.gistId, JSON.stringify(newGistId));
+        }
+        setCloudStatus('ok');
+        setCloudMsg('Salvo na nuvem ' + new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}));
+      } catch(e) {
+        setCloudStatus('error');
+        setCloudMsg('Erro ao salvar na nuvem');
+      }
+    }, 2000);
+  }, [projects, ghToken]);
 
-  const createProject = (data) => setProjects(prev => [...prev, data]);
-  const editProject = (id, data) => setProjects(prev => prev.map(p => p.id===id ? {...p,...data} : p));
-  const deleteProject = (id) => { setProjects(prev => prev.filter(p => p.id!==id)); if(currentProjectId===id) setCurrentProjectId(null); };
-  const updateProject = (id, data) => setProjects(prev => prev.map(p => p.id===id ? {...p,...data} : p));
-  const importProjects = (imported) => { setProjects(imported); setCurrentProjectId(null); };
+  // Pull from Gist on first load if configured
+  useEffect(() => {
+    if (!ghToken || !gistId) return;
+    setCloudStatus('syncing');
+    gistPull(ghToken, gistId).then(remoteProjects => {
+      setProjects(remoteProjects);
+      setCloudStatus('ok');
+      setCloudMsg('Dados carregados da nuvem');
+    }).catch(() => {
+      setCloudStatus('error');
+      setCloudMsg('Não foi possível carregar da nuvem');
+    });
+  }, []); // only on mount
+
+  const handleCloudSaved = (token, existingGistId) => {
+    save(STORAGE_KEYS.ghToken, JSON.stringify(token));
+    save(STORAGE_KEYS.gistId, JSON.stringify(existingGistId));
+    setGhToken(token); setGistId(existingGistId);
+    setShowCloud(false);
+    // Push current data immediately
+    gistPush(token, existingGistId, projects).then(id => {
+      setGistId(id); save(STORAGE_KEYS.gistId, JSON.stringify(id));
+      setCloudStatus('ok'); setCloudMsg('Conectado e salvo na nuvem ✓');
+    }).catch(() => { setCloudStatus('error'); setCloudMsg('Erro na primeira sincronização'); });
+  };
+
+  const currentProject = projects.find(p => p.id === currentProjectId);
+  const createProject  = (data) => setProjects(prev => [...prev, data]);
+  const editProject    = (id, data) => setProjects(prev => prev.map(p => p.id===id ? {...p,...data} : p));
+  const deleteProject  = (id) => { setProjects(prev => prev.filter(p => p.id!==id)); if(currentProjectId===id) setCurrentProjectId(null); };
+  const updateProject  = (id, data) => setProjects(prev => prev.map(p => p.id===id ? {...p,...data} : p));
+
+  const cloudIcon = cloudStatus==='syncing' ? <span className="spinner" style={{width:11,height:11,borderWidth:2}}/> 
+                  : cloudStatus==='ok'      ? '☁️' 
+                  : cloudStatus==='error'   ? '⚠️' 
+                  : '☁️';
 
   return (
     <div className="app">
-      {showSync && <SyncModal projects={projects} onImport={importProjects} onClose={()=>setShowSync(false)}/>}
+      {showCloud && <CloudModal onClose={()=>setShowCloud(false)} onSaved={handleCloudSaved} initialToken={ghToken} initialGistId={gistId}/>}
       <aside className="sidebar">
         <div className="sidebar-logo">
           <div className="logo-mark">
@@ -1029,9 +1112,10 @@ const App = () => {
               ))}
             </div>
           )}
-          <div className="nav-section" style={{marginTop:'auto',paddingTop:8}}>
-            <button className="nav-item" onClick={()=>setShowSync(true)}>
-              <Icon name="rotateCcw" size={15}/>Sincronizar dados
+          <div className="nav-section">
+            <button className="nav-item" onClick={()=>setShowCloud(true)}>
+              <span style={{fontSize:14}}>{ghToken ? '☁️' : '⚙️'}</span>
+              {ghToken ? 'Nuvem conectada' : 'Configurar nuvem'}
             </button>
           </div>
         </nav>
@@ -1047,8 +1131,11 @@ const App = () => {
         <div className="topbar">
           <span className="topbar-title">{currentProject ? currentProject.title : 'Dashboard'}</span>
           <div className="topbar-actions">
-            <button className="btn btn-secondary btn-sm" onClick={()=>setShowSync(true)} title="Sincronizar entre dispositivos">
-              <Icon name="rotateCcw" size={13}/>Sincronizar
+            <button className="btn btn-secondary btn-sm" onClick={()=>setShowCloud(true)}
+              title={cloudMsg || 'Configurar sincronização na nuvem'}
+              style={{gap:6, color: cloudStatus==='error'?'#B91C1C': cloudStatus==='ok'?'var(--green)':'var(--text2)'}}>
+              {cloudIcon}
+              {ghToken ? (cloudStatus==='syncing'?'Salvando…': cloudStatus==='ok'?'Nuvem OK': cloudStatus==='error'?'Erro nuvem':'Nuvem') : 'Configurar nuvem'}
             </button>
             <span style={{fontSize:12,color:'var(--text2)',background:'var(--bg)',padding:'5px 10px',borderRadius:6,border:'1px solid var(--border)'}}>
               {projects.length} {projects.length===1?'projeto':'projetos'}
